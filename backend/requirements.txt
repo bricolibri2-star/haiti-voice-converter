@@ -1,5 +1,308 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-python-multipart==0.0.9
-pytest==8.3.3
-httpx==0.27.2
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+import uuid
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from mutagen import File as MutagenFile
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+TEMP_DIR = Path(os.getenv("TEMP_DIR", str(BASE_DIR / "temp")))
+RESULT_DIR = Path(os.getenv("RESULT_DIR", str(BASE_DIR / "results")))
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", 50 * 1024 * 1024))
+MAX_REFERENCE_FILES = int(os.getenv("MAX_REFERENCE_FILES", 20))
+MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", 250 * 1024 * 1024))
+ENGINE_TIMEOUT_SECONDS = int(os.getenv("ENGINE_TIMEOUT_SECONDS", 1800))
+RESULT_TTL_SECONDS = int(os.getenv("RESULT_TTL_SECONDS", 86400))
+TEMP_TTL_SECONDS = int(os.getenv("TEMP_TTL_SECONDS", 3600))
+CONVERSION_CONCURRENCY = int(os.getenv("MAX_CONCURRENT_JOBS", 2))
+API_TOKEN = os.getenv("API_TOKEN")
+ALLOWED_SUFFIXES = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
+
+DEFAULT_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:8080",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:8080",
+]
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", ",".join(DEFAULT_ALLOWED_ORIGINS)).split(",")
+    if origin.strip()
+]
+
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", 30))
+RATE_LIMIT_SECONDS = int(os.getenv("RATE_LIMIT_SECONDS", 60))
+RATE_BUCKETS: dict[str, list[float]] = defaultdict(list)
+CONVERSION_SEMAPHORE = asyncio.Semaphore(CONVERSION_CONCURRENCY)
+
+app = FastAPI(title="Konvèti Voice API", version="0.5.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type", "X-Client-Id"],
+)
+
+
+def _cleanup_expired_files(directory: Path, ttl_seconds: int) -> None:
+    if not directory.exists():
+        directory.mkdir(parents=True, exist_ok=True)
+        return
+    now = time.time()
+    for path in directory.iterdir():
+        try:
+            if path.is_file() and now - path.stat().st_mtime > ttl_seconds:
+                path.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
+def _cleanup_everything() -> None:
+    _cleanup_expired_files(TEMP_DIR, TEMP_TTL_SECONDS)
+    _cleanup_expired_files(RESULT_DIR, RESULT_TTL_SECONDS)
+
+
+@app.on_event("startup")
+def startup() -> None:
+    _cleanup_everything()
+
+
+def _is_audio_header(header: bytes) -> bool:
+    return (
+        header.startswith(b"ID3")
+        or (len(header) > 1 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0)
+        or header.startswith((b"RIFF", b"fLaC", b"OggS"))
+        or (len(header) >= 8 and header[4:8] == b"ftyp")
+    )
+
+
+def _validate_audio_file(path: Path) -> None:
+    try:
+        audio = MutagenFile(str(path))
+    except Exception as exc:  # pragma: no cover - defensive against broken metadata
+        raise HTTPException(status_code=415, detail="Le fichier audio est invalide ou corrompu.") from exc
+    if audio is None:
+        raise HTTPException(status_code=415, detail="Le fichier audio est invalide ou corrompu.")
+    info = getattr(audio, "info", None)
+    if info is None:
+        raise HTTPException(status_code=415, detail="Impossible d’interpréter les métadonnées audio.")
+    duration = getattr(info, "length", None)
+    if duration is None or duration <= 0 or duration > 3600:
+        raise HTTPException(status_code=413, detail="La durée de l’audio doit être > 0 et < 1h.")
+
+
+async def _save_upload(upload: UploadFile, destination: Path) -> int:
+    suffix = Path(upload.filename or "audio.mp3").suffix.lower()
+    if suffix not in ALLOWED_SUFFIXES:
+        raise HTTPException(status_code=415, detail="Formats acceptés : MP3, WAV, M4A, FLAC et OGG.")
+
+    size = 0
+    header = b""
+    try:
+        with destination.open("wb") as stream:
+            while chunk := await upload.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_FILE_BYTES:
+                    raise HTTPException(status_code=413, detail="Un fichier dépasse la limite configurée.")
+                if not header:
+                    header = chunk[:16]
+                stream.write(chunk)
+    except HTTPException:
+        destination.unlink(missing_ok=True)
+        raise
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        await upload.close()
+
+    if not size or not _is_audio_header(header):
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=415, detail="Le fichier ne semble pas être un audio pris en charge.")
+
+    _validate_audio_file(destination)
+    return size
+
+
+def _get_client_id(request: Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown-client"
+
+
+def _require_api_key(request: Request) -> None:
+    if not API_TOKEN:
+        return
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Une clé d’API valide est requise.")
+    token = auth.split(" ", 1)[1].strip()
+    if token != API_TOKEN:
+        raise HTTPException(status_code=401, detail="Token API invalide.")
+
+
+def _check_rate_limit(request: Request) -> None:
+    client_id = _get_client_id(request)
+    now = time.time()
+    bucket = RATE_BUCKETS[client_id]
+    bucket[:] = [stamp for stamp in bucket if now - stamp < RATE_LIMIT_SECONDS]
+    if len(bucket) >= RATE_LIMIT_REQUESTS:
+        raise HTTPException(status_code=429, detail="Trop de requêtes dans la fenêtre de temps.")
+    bucket.append(now)
+
+
+def _run_engine(source: Path, refs_manifest: Path, output: Path, fidelity: float, pitch: float) -> None:
+    raw_command = os.getenv("VOICE_CONVERSION_COMMAND")
+    if not raw_command:
+        raise HTTPException(status_code=503, detail="Le moteur vocal n’est pas configuré ; aucune conversion factice n’est produite.")
+    try:
+        template: Any = json.loads(raw_command)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="VOICE_CONVERSION_COMMAND doit être un tableau JSON.") from exc
+    if not isinstance(template, list) or not template or not all(isinstance(arg, str) for arg in template):
+        raise HTTPException(status_code=500, detail="La commande du moteur doit être un tableau JSON de chaînes.")
+    values = {
+        "source": str(source.resolve()),
+        "references_manifest": str(refs_manifest.resolve()),
+        "output": str(output.resolve()),
+        "fidelity": str(fidelity),
+        "pitch": str(pitch),
+    }
+    try:
+        argv = [arg.format(**values) for arg in template]
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail="Variable inconnue dans la commande du moteur.") from exc
+
+    try:
+        process = subprocess.run(argv, capture_output=True, text=True, timeout=ENGINE_TIMEOUT_SECONDS, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=504, detail="Le traitement vocal a dépassé le délai maximal.") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Impossible de lancer le moteur configuré.") from exc
+
+    if process.returncode != 0:
+        raise HTTPException(status_code=502, detail="Le moteur vocal a échoué ; consultez les journaux côté serveur.")
+    if not output.is_file() or output.stat().st_size == 0:
+        raise HTTPException(status_code=502, detail="Le moteur n’a pas produit de fichier audio valide.")
+
+
+@app.get("/health")
+def health() -> dict[str, str | bool]:
+    return {"status": "ok", "service": "konveti-voice-api", "engine_configured": bool(os.getenv("VOICE_CONVERSION_COMMAND"))}
+
+
+@app.post("/convert")
+async def convert_voice(
+    request: Request,
+    source_audio: UploadFile = File(...),
+    reference_audio: list[UploadFile] = File(...),
+    language: str = Form("ht"),
+    voice_name: str = Form("voice"),
+    fidelity: float = Form(0.75),
+    pitch: float = Form(0.0),
+    consent: bool = Form(False),
+):
+    _require_api_key(request)
+    _check_rate_limit(request)
+    _cleanup_everything()
+
+    if not consent:
+        raise HTTPException(status_code=400, detail="Confirmez votre autorisation d’utiliser la voix de référence.")
+    if not reference_audio or len(reference_audio) > MAX_REFERENCE_FILES:
+        raise HTTPException(status_code=422, detail=f"Ajoutez de 1 à {MAX_REFERENCE_FILES} fichiers de référence.")
+    if not 0.0 <= fidelity <= 1.0 or not -12.0 <= pitch <= 12.0:
+        raise HTTPException(status_code=422, detail="Les paramètres de fidélité ou de hauteur sont hors limites.")
+    if language not in {"ht", "fr"}:
+        raise HTTPException(status_code=422, detail="Langues acceptées : ht ou fr.")
+
+    job_id = uuid.uuid4().hex
+    work_dir = TEMP_DIR / job_id
+    work_dir.mkdir(mode=0o700, parents=True)
+    result_path: Path | None = None
+    try:
+        source_suffix = Path(source_audio.filename or "source.mp3").suffix.lower() or ".mp3"
+        source_path = work_dir / f"source{source_suffix}"
+        await _save_upload(source_audio, source_path)
+
+        refs_dir = work_dir / "references"
+        refs_dir.mkdir(mode=0o700)
+        ref_paths: list[Path] = []
+        aggregate_size = source_path.stat().st_size
+        for index, upload in enumerate(reference_audio):
+            suffix = Path(upload.filename or "reference.mp3").suffix.lower() or ".mp3"
+            ref_path = refs_dir / f"ref_{index:02d}{suffix}"
+            aggregate_size += await _save_upload(upload, ref_path)
+            if aggregate_size > MAX_REQUEST_BYTES:
+                raise HTTPException(status_code=413, detail="La taille totale de la requête dépasse la limite configurée.")
+            ref_paths.append(ref_path)
+
+        refs_manifest = work_dir / "references.json"
+        refs_manifest.write_text(json.dumps([str(path.resolve()) for path in ref_paths]), encoding="utf-8")
+
+        output_path = work_dir / "result.wav"
+        async with CONVERSION_SEMAPHORE:
+            await asyncio.to_thread(_run_engine, source_path, refs_manifest, output_path, fidelity, pitch)
+
+        safe_name = re.sub(r"[^\w -]", "", voice_name, flags=re.UNICODE).strip()[:40] or "voice"
+        result_path = RESULT_DIR / f"{job_id}_{safe_name}.wav"
+        shutil.copyfile(output_path, result_path)
+        return {
+            "request_id": job_id,
+            "status": "completed",
+            "reference_count": len(ref_paths),
+            "result_url": f"/result/{job_id}",
+            "message": "Conversion terminée.",
+        }
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.get("/result/{request_id}")
+def get_result(request: Request, request_id: str):
+    _require_api_key(request)
+    _check_rate_limit(request)
+    if not re.fullmatch(r"[a-f0-9]{32}", request_id):
+        raise HTTPException(status_code=400, detail="Identifiant invalide.")
+    matches = list(RESULT_DIR.glob(f"{request_id}_*.wav"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Résultat introuvable ou supprimé.")
+    return FileResponse(matches[0], media_type="audio/wav", filename=matches[0].name)
+
+
+@app.get("/jobs")
+def list_jobs(request: Request):
+    _require_api_key(request)
+    _check_rate_limit(request)
+    jobs = []
+    for item in RESULT_DIR.glob("*.wav"):
+        jobs.append({"file": item.name, "path": str(item), "modified_at": item.stat().st_mtime})
+    return {"jobs": jobs}
+
+
+@app.on_event("shutdown")
+def shutdown() -> None:
+    _cleanup_everything()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
