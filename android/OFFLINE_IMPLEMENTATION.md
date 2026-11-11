@@ -1,27 +1,15 @@
-# Android offline implementation plan and scaffold
+# Offline Android build path
 
-The new Kotlin files define two boundaries:
+The project now has a Gradle app module and an offline conversion coordinator. The coordinator copies user-selected document URIs into bounded, app-private temporary files, requires explicit consent and a local model, calls the `OfflineVoiceEngine` contract, checks that the result has a RIFF/WAVE header, and deletes temporary input copies on success or failure.
 
-- `ModelManager` inspects a model in app-private `filesDir/offline-model/` and verifies the model file against the SHA-256 value in `model.json`.
-- `OfflineVoiceEngine` and `OfflineConversionRepository` define the local conversion contract and options for fidelity, pitch and language.
+## Still not a working converter
 
-These are scaffolding, **not an inference engine**. There is no model/runtime adapter in this repository yet; the application must not report a conversion as successful until a real adapter creates a valid output WAV.
+There is no implementation of `OfflineVoiceEngine` and no real voice model in this repository. ONNX Runtime is a runtime library only; it cannot convert speech without a model whose input/output tensor contract and preprocessing are known. `model.json.example` is a template and is intentionally not installable. Do not replace its hash/license placeholders with guessed values.
 
-## Model integrity
+## Next implementation gate
 
-`ModelManager` expects a manifest with `model_id`, `runtime`, `model_filename`, and `sha256`, alongside the model file. The filename is constrained to a simple basename and the actual file hash is checked. This detects accidental corruption, but a hash stored beside a model is not a trusted signature: production distribution must pin the expected hash in a trusted release or verify a signed manifest. Check the model license before bundling or downloading it.
+Select a legally redistributable, consented model that supports the desired reference-conditioned voice conversion. Document tensor names, shapes, sample rates, normalization, chunking and output format. Then implement and test the matching Android ONNX adapter; a generic `session.run` is not enough to define voice conversion. Build and test on target devices, including an airplane-mode test after model installation.
 
-## Offline pipeline to implement
+## Build prerequisites
 
-1. Copy selected source/reference content URIs into app-private temporary storage using bounded streaming; do not rely on display names or filesystem paths from the picker.
-2. Validate and decode in a bounded worker. Use app-private temporary files, cleanup in `finally`, cancellation, disk-space checks and progress reporting.
-3. Check `ModelManager.inspectInstalledModel()` and fail clearly if the model is absent or invalid.
-4. Invoke a real Android-compatible runtime through an `OfflineVoiceEngine` implementation. It must not make network calls; validate output format and nonzero duration before success.
-5. Export the result through Android's document picker/MediaStore only after successful inference; provide playback and an explicit cleanup action.
-6. Run acceptance tests with network disabled after setup: convert source + authorized reference(s), listen, export, restart, and repeat without any network request.
-
-Model choice is still a prerequisite. Traditional RVC checkpoints are not automatically reference-conditioned mobile models, and merely adding multiple reference files does not guarantee voice conversion. Choose and benchmark a model/runtime on target phones before implementing its adapter. Do not embed an API token in the APK.
-
-## Current build status
-
-The repository currently has a prototype UI and these contracts only. It does not yet include complete Android Gradle build files, a voice model, a model installer, or a functioning local inference implementation. Therefore no functional offline APK can be built from this scaffold alone.
+Use JDK 17, Android SDK 34 and a compatible Gradle 8.x installation. From this directory, build with `gradle :app:assembleDebug`. No Gradle wrapper or APK artifact is committed yet. A successful Gradle build would validate packaging only, not the existence or quality of the voice engine.

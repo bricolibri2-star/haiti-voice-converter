@@ -1,0 +1,10 @@
+{
+  "model_id": "replace-with-consented-model-id",
+  "runtime": "onnxruntime",
+  "version": "0.0.0",
+  "model_filename": "model.onnx",
+  "sha256": "REPLACE_WITH_64_CHARACTER_SHA256",
+  "license": "REPLACE_WITH_VERIFIED_MODEL_LICENSE",
+  "language": "ht",
+  "target_voice": "REPLACE_WITH_CONSENTED_SPEAKER_PROFILE"
+}
