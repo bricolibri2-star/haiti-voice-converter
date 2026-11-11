@@ -1,5 +1,5 @@
 # Projet Android
 
-Ouvrir ce dossier dans Android Studio avec JDK 17. L’écran propose deux sélecteurs de fichiers audio, une confirmation d’autorisation et des paramètres visuels de fidélité/hauteur.
+L’application Android permet de choisir un audio source et plusieurs fichiers de référence, puis d’afficher un contrôle de consentement et des paramètres audio.
 
-Cette version est un prototype d’interface : le choix des fichiers fonctionne, mais le bouton ne lance pas encore de conversion. Il faut connecter et déployer le moteur vocal backend avant de pouvoir produire un audio transformé.
+La sélection de fichiers est implémentée. L’appel réseau vers le backend, la progression, la lecture et le téléchargement du résultat restent à intégrer. La conversion réelle exige un moteur vocal installé côté serveur.
